@@ -140,3 +140,14 @@ bb test                 # or: nix flake check
 `--dry-run` runs the whole proxy with 1Password and the upstream mocked: the
 response says what would have been sent. It warns about the integrity checks
 instead of refusing.
+
+## Claude skill
+
+[`skill/SKILL.md`](skill/SKILL.md) teaches Claude Code the workflow: check for
+a live session, never read 1Password itself, read the proxy's errors, and
+treat blocked hosts as deliberate. Link the `skill` directory to
+`~/.claude/skills/unlock`, e.g. with home-manager:
+
+```nix
+home-manager.users.<you>.home.file.".claude/skills/unlock".source = "${unlock}/skill";
+```
