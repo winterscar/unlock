@@ -72,7 +72,7 @@
       h)))
 
 (defn- host-glob->regex
-  "\"*.oth.io\" -> a regex where * matches exactly one DNS label."
+  "\"*.example.com\" -> a regex where * matches exactly one DNS label."
   [glob]
   (re-pattern (str/join "[a-z0-9-]+" (map #(java.util.regex.Pattern/quote %)
                                           (str/split (str/lower-case glob) #"\*" -1)))))
@@ -147,7 +147,7 @@
   {:bearer     [:token]
    :basic      [:username :password]
    :header     [:value]
-   :oth-client [:client-key :client-secret]})
+   :login      [:username :password]})
 
 (defn resolve-secrets
   "Reads every secret the service's :auth needs. Returns the auth map with the
@@ -170,38 +170,55 @@
   (->> (concat (vals (select-keys auth (ref-keys (:type auth)))) [bearer])
        (concat (when (= :basic (:type auth))
                  [(base64 (str (:username auth) ":" (:password auth)))]))
-       (concat (when (= :oth-client (:type auth))
-                 [(base64 (str (:client-key auth) ":" (:client-secret auth)))]))
+       (concat (when (= :login (:type auth))
+                 [(base64 (str (:username auth) ":" (:password auth)))]))
        (remove nil?)
        (filter #(>= (count %) 6))
        distinct))
 
-(defn- oth-exchange
-  "Swaps the OTH system client's key and secret for a Bearer token at IDP2."
-  [send base-url {:keys [client-key client-secret]}]
-  (let [resp (send {:method :get
-                    :uri (str base-url "/idp2/clients/auth")
-                    :headers {"authorization" (str "Basic " (base64 (str client-key ":" client-secret)))
-                              "accept" "application/json"}})]
-    (when-not (= 200 (:status resp))
-      (throw (ex-info (str "OTH client auth failed with HTTP " (:status resp)) {})))
-    (let [{:keys [token exp]} (json/parse-string (String. ^bytes (:body resp) StandardCharsets/UTF_8) true)]
-      {:token token
-       :exp (or exp (+ (now-s) 600))})))
+(defn- json-field
+  "\"a.b\" -> (get-in m [:a :b])."
+  [m dotted]
+  (get-in m (map keyword (str/split dotted #"\."))))
+
+(defn- login!
+  "Swaps Basic credentials for a Bearer token at the service's :login-path.
+  Many services count failed logins towards locking the account, so a failure
+  is remembered in `token-cache` and no further login is attempted until
+  unlock is restarted."
+  [send base-url {:keys [login-path login-method token-field exp-field username password]} token-cache]
+  (let [resp (send {:method (or login-method :get)
+                    :uri (str base-url login-path)
+                    :headers {"authorization" (str "Basic " (base64 (str username ":" password)))
+                              "accept" "application/json"}})
+        body (when (= 200 (:status resp))
+               (json/parse-string (String. ^bytes (:body resp) StandardCharsets/UTF_8) true))
+        token (some-> body (json-field (or token-field "token")))]
+    (when-not token
+      (let [msg (str "login at " login-path " failed (HTTP " (:status resp)
+                     (when (= 200 (:status resp)) ", no token in response")
+                     "); not retrying until unlock is restarted")]
+        (swap! token-cache assoc :failed msg)
+        (throw (ex-info msg {}))))
+    ;; With no expiry to go on, the token is reused until the upstream 401s.
+    {:token token
+     :exp (or (some-> body (json-field (or exp-field "exp"))) Long/MAX_VALUE)}))
 
 (defn- auth-header
-  "[header-name value] to inject, refreshing an OTH token when it is close to
-  expiry or when `force?` says the upstream just rejected it."
+  "[header-name value] to inject, logging in again when a :login token is close
+  to expiry or when `force?` says the upstream just rejected it."
   [{:keys [auth base-url send token-cache]} force?]
   (case (:type auth)
     :bearer ["authorization" (str "Bearer " (:token auth))]
     :basic  ["authorization" (str "Basic " (base64 (str (:username auth) ":" (:password auth))))]
     :header [(str/lower-case (:name auth)) (str/replace (or (:format auth) "{}") "{}" (:value auth))]
-    :oth-client
-    (let [{:keys [token exp]} @token-cache]
-      (if (and token (not force?) (> exp (+ (now-s) 60)))
-        ["authorization" (str "Bearer " token)]
-        (let [fresh (oth-exchange send base-url auth)]
+    :login
+    (let [{:keys [token exp failed]} @token-cache]
+      (cond
+        failed (throw (ex-info failed {}))
+        (and token (not force?) (> exp (+ (now-s) 60))) ["authorization" (str "Bearer " token)]
+        :else
+        (let [fresh (login! send base-url auth token-cache)]
           (reset! token-cache fresh)
           ["authorization" (str "Bearer " (:token fresh))])))))
 
@@ -259,6 +276,7 @@
   (cond
     (nil? body) nil
     (bytes? body) body
+    (string? body) (.getBytes ^String body StandardCharsets/UTF_8)
     :else (.readAllBytes ^java.io.InputStream body)))
 
 (defn- log [& parts]
@@ -293,10 +311,14 @@
                                        :uri (str base-url uri (when query-string (str "?" query-string)))
                                        :headers (assoc out-headers hk hv)
                                        :body body})))
-                    resp (let [r (attempt false)]
-                           (if (and (= 401 (:status r)) (= :oth-client (get-in service [:auth :type])))
-                             (attempt true)
-                             r))
+                    resp (try
+                           (let [r (attempt false)]
+                             (if (and (= 401 (:status r)) (= :login (get-in service [:auth :type])))
+                               (attempt true)
+                               r))
+                           (catch clojure.lang.ExceptionInfo e
+                             (log "ERROR" (ex-message e))
+                             (deny 502 (ex-message e))))
                     secrets (secret-strings (:auth ctx) (:token @(:token-cache ctx)))]
                 {:status (:status resp)
                  :headers (inbound-headers secrets (:headers resp))
@@ -346,6 +368,8 @@
           (fn [svc]
             (cond-> svc
               (:auth svc)  (update-in [:auth :type] keyword)
+              (get-in svc [:auth :login-method])
+              (update-in [:auth :login-method] (comp keyword str/lower-case name))
               (:allow svc) (update :allow (partial mapv (fn [[m glob]]
                                                           [(keyword (str/lower-case (name m))) glob])))))))
 
@@ -401,10 +425,11 @@
        (when (seq services)
          (str "\n\nServices: " (str/join ", " (map name (keys services)))))))
 
-(defn- dry-run-deps []
+(defn- dry-run-deps [service]
   {:read-secret (fn [ref] (str "dry-run-secret-for:" ref))
    :send (fn [{:keys [method uri headers]}]
-           (if (str/ends-with? uri "/idp2/clients/auth")
+           (if (and (= :login (get-in service [:auth :type]))
+                    (str/ends-with? (first (str/split uri #"\?")) (get-in service [:auth :login-path])))
              {:status 200 :headers {"content-type" "application/json"}
               :body (.getBytes (json/generate-string {:token "dry-run-bearer" :exp (+ (now-s) 1800)}))}
              {:status 200
@@ -443,7 +468,7 @@
           problems (integrity-problems [(System/getProperty "babashka.file") (:config opts) op-bin])
           seconds (parse-duration (:for opts))
           deps (if (:dry-run opts)
-                 (dry-run-deps)
+                 (dry-run-deps service)
                  (let [client (http/client {:follow-redirects :never :version :http1.1})]
                    {:read-secret (partial op-read op-bin)
                     :send (partial http-send client)}))]

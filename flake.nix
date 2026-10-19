@@ -51,7 +51,7 @@
               description = ''
                 Services unlock can front, keyed by name. Same shape as
                 services.example.edn, with strings for keywords:
-                auth.type = "oth-client", allow = [ [ "get" "/api/**" ] ].
+                auth.type = "login", allow = [ [ "get" "/api/**" ] ].
               '';
             };
           };

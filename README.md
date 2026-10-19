@@ -89,9 +89,10 @@ unlock = { url = "git+file:///Users/mat/src/unlock"; inputs.nixpkgs.follows = "n
       deny-hosts = [ "doccla-prod.oth.io" ];
       default-host = "doccla-dev.oth.io";
       auth = {
-        type = "oth-client";
-        client-key = "op://Vault/OTH client {host}/username";
-        client-secret = "op://Vault/OTH client {host}/credential";
+        type = "login";
+        login-path = "/idp2/users/auth";
+        username = "op://Employee/OTH - Dev/username";
+        password = "op://Employee/OTH - Dev/password";
       };
     };
   };
@@ -115,13 +116,16 @@ system flake.
 ## Configuration
 
 See [`services.example.edn`](services.example.edn). In nix, keywords become
-strings: `type = "oth-client"`, `allow = [ [ "get" "/api/**" ] ]`. `:auth`
+strings: `type = "login"`, `allow = [ [ "get" "/api/**" ] ]`. `:auth`
 types:
 
 - `:bearer`, `:basic` and `:header` inject the secret directly.
-- `:oth-client` exchanges an OpenTele system client's key and secret for a
-  Bearer token at `<host>/idp2/clients/auth`. It refreshes the token near
-  expiry, and once on a 401.
+- `:login` sends Basic `username:password` to `:login-path` and uses the
+  token in the JSON response (`:token-field`, default `token`; a dotted path
+  like `data.access` works) as a Bearer token. It logs in again when
+  `:exp-field` (default `exp`, unix seconds) is close, and once if a request
+  gets a 401. A failed login is not retried until you restart `unlock`,
+  because many services lock an account after repeated bad logins.
 
 `{host}` in an `op://` reference is replaced with the unlocked host, so each
 environment can have its own 1Password item.

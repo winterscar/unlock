@@ -5,23 +5,28 @@
 ;;   :allow-hosts   host globs the service may be unlocked against; * is one DNS label
 ;;   :deny-hosts    host globs that are refused even if allowed
 ;;   :default-host  used when `unlock <service>` is given no host
+;;   :scheme        "https" (default) or "http"
 ;;   :auth          what to inject. {host} in a reference is replaced by the host.
-;;                  {:type :bearer     :token "op://..."}
-;;                  {:type :basic      :username "op://..." :password "op://..."}
-;;                  {:type :header     :name "X-Api-Key" :value "op://..." :format "{}"}
-;;                  {:type :oth-client :client-key "op://..." :client-secret "op://..."}
-;;                    (exchanged for a Bearer token at <host>/idp2/clients/auth)
+;;                  {:type :bearer :token "op://..."}
+;;                  {:type :basic  :username "op://..." :password "op://..."}
+;;                  {:type :header :name "X-Api-Key" :value "op://..." :format "{}"}
+;;                  {:type :login  :username "op://..." :password "op://..."
+;;                   :login-path "/auth"        ; Basic credentials sent here...
+;;                   :login-method :get         ; default :get
+;;                   :token-field "token"       ; ...Bearer token read from here (dotted path)
+;;                   :exp-field "exp"}          ; optional unix-seconds expiry
 ;;   :allow         optional [method path-glob] rules, e.g. [[:get "/api/**"]];
 ;;                  omit to allow every method and path.
 
 {:op-bin "/usr/local/bin/op"
 
  :services
- {:opentele
-  {:allow-hosts  ["*.oth.io"]
-   :deny-hosts   ["doccla-prod.oth.io"]
-   :default-host "doccla-dev.oth.io"
-   ;; TODO: point these at the real 1Password items.
-   :auth {:type          :oth-client
-          :client-key    "op://Employee/OTH client {host}/username"
-          :client-secret "op://Employee/OTH client {host}/credential"}}}}
+ {:example
+  {:allow-hosts  ["*.example.com"]
+   :deny-hosts   ["prod.example.com"]
+   :default-host "dev.example.com"
+   :auth {:type       :login
+          :login-path "/auth/login"
+          :username   "op://Private/Example dev/username"
+          :password   "op://Private/Example dev/password"}
+   :allow [[:get "/api/**"]]}}}

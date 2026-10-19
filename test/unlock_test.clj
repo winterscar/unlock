@@ -15,10 +15,12 @@
 (defn- upstream-handler [{:keys [uri headers] :as req}]
   (swap! seen conj (select-keys req [:request-method :uri :query-string :headers]))
   (case uri
-    "/idp2/clients/auth"
-    (if (= (get headers "authorization") (str "Basic " (u/base64 "key-1:secret-1")))
+    "/auth/login"
+    (if (= (get headers "authorization") (str "Basic " (u/base64 "agent-user:pw-123456")))
       {:status 200 :body (json/generate-string {:token (str "bearer-" (count @seen)) :exp 9999999999})}
-      {:status 401})
+      {:status 401 :body "{\"message\": \"Invalid credentials\"}"})
+    "/auth/nested"
+    {:status 200 :body (json/generate-string {:data {:access (str "bearer-" (count @seen))}})}
     "/echo-secret" {:status 200
                    :headers {"x-echo" (str (get headers "authorization"))}
                    :body (str "your key is s3cret-value-123, you sent " (get headers "authorization"))}
@@ -44,8 +46,9 @@
 
 (def secrets
   {"op://V/bearer/credential" "s3cret-value-123"
-   "op://V/OTH 127.0.0.1/username" "key-1"
-   "op://V/OTH 127.0.0.1/credential" "secret-1"})
+   "op://V/login 127.0.0.1/username" "agent-user"
+   "op://V/login 127.0.0.1/password" "pw-123456"
+   "op://V/login/wrong-password" "not-the-password"})
 
 (defn- deps []
   {:read-secret #(or (secrets (str/replace % #":\d+" "")) (throw (ex-info (str "no secret " %) {})))
@@ -55,6 +58,11 @@
   (merge {:scheme "http" :allow-hosts ["127.0.0.1:*"] :auth auth} more))
 
 (def bearer {:type :bearer :token "op://V/bearer/credential"})
+
+(def login {:type :login
+            :login-path "/auth/login"
+            :username "op://V/login {host}/username"
+            :password "op://V/login {host}/password"})
 
 (defmacro with-session [[sym svc] & body]
   `(let [~sym (u/start! {:service-name :test :service ~svc :host (upstream-host)} (deps))]
@@ -68,20 +76,20 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest hosts
-  (let [svc {:allow-hosts ["*.oth.io"] :deny-hosts ["doccla-prod.oth.io"]}]
-    (is (= "doccla-dev.oth.io" (u/check-host svc "Doccla-Dev.oth.io.")))
-    (doseq [h ["doccla-prod.oth.io" "DOCCLA-PROD.OTH.IO" "doccla-prod.oth.io."]]
+  (let [svc {:allow-hosts ["*.example.com"] :deny-hosts ["prod.example.com"]}]
+    (is (= "dev.example.com" (u/check-host svc "Dev.Example.com.")))
+    (doseq [h ["prod.example.com" "PROD.EXAMPLE.COM" "prod.example.com."]]
       (is (thrown-with-msg? Exception #"blocked" (u/check-host svc h)) h))
-    (doseq [h ["oth.io" "a.b.oth.io" "doccla-dev.oth.io.evil.com" "evil.com"]]
+    (doseq [h ["example.com" "a.b.example.com" "dev.example.com.evil.com" "evil.com"]]
       (is (thrown-with-msg? Exception #"not in this service" (u/check-host svc h)) h))
-    (doseq [h ["https://doccla-dev.oth.io" "evil.com/@doccla-dev.oth.io" "user@doccla-dev.oth.io" ""]]
+    (doseq [h ["https://dev.example.com" "evil.com/@dev.example.com" "user@dev.example.com" ""]]
       (is (thrown-with-msg? Exception #"Not a valid host" (u/check-host svc h)) h))))
 
 (deftest blocked-host-never-reads-secrets
   (let [reads (atom 0)]
     (is (thrown? Exception
-                 (u/start! {:service-name :t :host "doccla-prod.oth.io"
-                            :service {:allow-hosts ["*.oth.io"] :deny-hosts ["doccla-prod.oth.io"] :auth bearer}}
+                 (u/start! {:service-name :t :host "prod.example.com"
+                            :service {:allow-hosts ["*.example.com"] :deny-hosts ["prod.example.com"] :auth bearer}}
                            {:read-secret (fn [_] (swap! reads inc) "x") :send (fn [_] {:status 200})})))
     (is (zero? @reads))))
 
@@ -150,26 +158,39 @@
     (is (= 200 (:status (call s "/ok"))))
     (is (= ["/ok"] (map :uri @seen)))))
 
-(deftest oth-client-exchange
-  (let [auth {:type :oth-client
-              :client-key "op://V/OTH {host}/username"
-              :client-secret "op://V/OTH {host}/credential"}]
-    (with-session [s (service auth)]
-      (is (= 200 (:status (call s "/a"))))
-      (is (= 200 (:status (call s "/b"))))
-      (testing "exchanges once, then reuses the token"
-        (is (= ["/idp2/clients/auth" "/a" "/b"] (map :uri @seen)))
-        (is (= "Bearer bearer-1" (get-in (nth @seen 1) [:headers "authorization"])))))
-    (reset! seen [])
-    (with-session [s (service auth)]
-      (testing "a 401 forces one re-exchange and retry"
-        (let [r (call s "/expire")]
-          (is (= 200 (:status r)))
-          (is (= ["/idp2/clients/auth" "/expire" "/idp2/clients/auth" "/expire"] (map :uri @seen)))))
-      (testing "the exchanged token is scrubbed from what the agent sees"
-        (let [r (call s "/echo-secret")]
-          (is (not (str/includes? (:body r) "bearer-")))
-          (is (not (str/includes? (get-in r [:headers "x-echo"]) "bearer-"))))))))
+(deftest login-exchange
+  (with-session [s (service login)]
+    (is (= 200 (:status (call s "/a"))))
+    (is (= 200 (:status (call s "/b"))))
+    (testing "logs in once, then reuses the token"
+      (is (= ["/auth/login" "/a" "/b"] (map :uri @seen)))
+      (is (= "Bearer bearer-1" (get-in (nth @seen 1) [:headers "authorization"])))))
+  (reset! seen [])
+  (with-session [s (service login)]
+    (testing "a 401 forces one fresh login and retry"
+      (let [r (call s "/expire")]
+        (is (= 200 (:status r)))
+        (is (= ["/auth/login" "/expire" "/auth/login" "/expire"] (map :uri @seen)))))
+    (testing "the token and the Basic credentials are scrubbed from what the agent sees"
+      (let [r (call s "/echo-secret")]
+        (is (not (str/includes? (:body r) "bearer-")))
+        (is (not (str/includes? (get-in r [:headers "x-echo"]) "bearer-")))
+        (is (not (str/includes? (:body r) (u/base64 "agent-user:pw-123456"))))))))
+
+(deftest login-token-field
+  (with-session [s (service (assoc login :login-path "/auth/nested" :token-field "data.access"))]
+    (is (= 200 (:status (call s "/a"))))
+    (is (= "Bearer bearer-1" (get-in (second @seen) [:headers "authorization"])))))
+
+(deftest failed-login-is-not-retried
+  ;; Services often count failed logins towards locking the account.
+  (with-session [s (service (assoc login :password "op://V/login/wrong-password"))]
+    (let [r1 (call s "/a")
+          r2 (call s "/b")]
+      (is (= 502 (:status r1)))
+      (is (str/includes? (:body r1) "not retrying"))
+      (is (= 502 (:status r2)))
+      (is (= ["/auth/login"] (map :uri @seen)) "one login attempt, and no upstream calls"))))
 
 (deftest durations
   (is (= 1800 (u/parse-duration "30m")))
@@ -182,11 +203,13 @@
   (let [f (java.io.File/createTempFile "unlock" ".json")]
     (spit f (json/generate-string
              {:op-bin "/usr/local/bin/op"
-              :services {:opentele {:allow-hosts ["*.oth.io"]
-                                    :auth {:type "oth-client" :client-key "op://a" :client-secret "op://b"}
-                                    :allow [["GET" "/api/**"] ["any" "/health"]]}}}))
-    (let [svc (get-in (u/read-config (str f)) [:services :opentele])]
-      (is (= :oth-client (get-in svc [:auth :type])))
+              :services {:svc {:allow-hosts ["*.example.com"]
+                               :auth {:type "login" :login-method "POST" :login-path "/l"
+                                      :username "op://a" :password "op://b"}
+                               :allow [["GET" "/api/**"] ["any" "/health"]]}}}))
+    (let [svc (get-in (u/read-config (str f)) [:services :svc])]
+      (is (= :login (get-in svc [:auth :type])))
+      (is (= :post (get-in svc [:auth :login-method])))
       (is (= [[:get "/api/**"] [:any "/health"]] (:allow svc)))
       (is (u/allowed? svc :get "/api/x"))
       (is (not (u/allowed? svc :post "/api/x"))))
