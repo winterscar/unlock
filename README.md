@@ -65,7 +65,7 @@ What is still exposed:
 - **Response data reaches the agent.** Nothing inspects what the upstream sends
   back. Use `:allow` rules to keep the agent on the paths you mean.
 - **Your shell setup is yours to protect.** The module defines `unlock` as an
-  alias in `/etc/zshrc` (root-owned), so a fake `unlock` earlier on `PATH`
+  alias in `/etc/zprofile` (root-owned), so a fake `unlock` earlier on `PATH`
   doesn't win. An agent could still override it from your own rc files, or
   replace the `~/.zshrc` symlink.
 - **It is not a sandbox.** It stops credentials leaking by accident or through

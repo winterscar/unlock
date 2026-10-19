@@ -68,7 +68,7 @@
               services = cfg.services;
             };
 
-            # Defined in /etc/zshrc (root-owned) so a stray `unlock` earlier on
+            # Defined in /etc/zprofile (root-owned) so a stray `unlock` earlier on
             # PATH, e.g. in ~/.local/bin, is not what runs.
             environment.shellAliases.unlock = "${cfg.package}/bin/unlock";
           };
