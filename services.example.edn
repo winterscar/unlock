@@ -1,0 +1,27 @@
+;; unlock services. Installed root-owned at /usr/local/etc/unlock/services.edn
+;; by install.sh; unlock refuses to run while this file is user-writable.
+;;
+;; Per service:
+;;   :allow-hosts   host globs the service may be unlocked against; * is one DNS label
+;;   :deny-hosts    host globs that are refused even if allowed
+;;   :default-host  used when `unlock <service>` is given no host
+;;   :auth          what to inject. {host} in a reference is replaced by the host.
+;;                  {:type :bearer     :token "op://..."}
+;;                  {:type :basic      :username "op://..." :password "op://..."}
+;;                  {:type :header     :name "X-Api-Key" :value "op://..." :format "{}"}
+;;                  {:type :oth-client :client-key "op://..." :client-secret "op://..."}
+;;                    (exchanged for a Bearer token at <host>/idp2/clients/auth)
+;;   :allow         optional [method path-glob] rules, e.g. [[:get "/api/**"]];
+;;                  omit to allow every method and path.
+
+{:op-bin "/usr/local/bin/op"
+
+ :services
+ {:opentele
+  {:allow-hosts  ["*.oth.io"]
+   :deny-hosts   ["doccla-prod.oth.io"]
+   :default-host "doccla-dev.oth.io"
+   ;; TODO: point these at the real 1Password items.
+   :auth {:type          :oth-client
+          :client-key    "op://Employee/OTH client {host}/username"
+          :client-secret "op://Employee/OTH client {host}/credential"}}}}
