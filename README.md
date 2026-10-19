@@ -77,7 +77,7 @@ The flake exports `darwinModules.default`:
 
 ```nix
 # flake.nix inputs
-unlock = { url = "git+file:///Users/mat/src/unlock"; inputs.nixpkgs.follows = "nixpkgs"; };
+unlock = { url = "git+ssh://git@github.com/winterscar/unlock.git"; inputs.nixpkgs.follows = "nixpkgs"; };
 
 # a darwin module
 { unlock, ... }: {
