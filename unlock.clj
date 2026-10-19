@@ -10,8 +10,8 @@
 ;; is gone.
 ;;
 ;; It has no admin API, no policy reload, and no on-disk secret. Install the
-;; script and its config root-owned (see install.sh) so a same-user agent cannot
-;; edit them; the script refuses to unlock anything when they are user-writable.
+;; script and its config root-owned (the nix module or install.sh) so a same-user
+;; agent cannot edit them; it refuses to unlock anything when they are writable.
 
 (ns unlock
   (:require [babashka.cli :as cli]
@@ -29,7 +29,9 @@
            (java.time Instant)
            (java.util Base64)))
 
-(def default-config "/usr/local/etc/unlock/services.edn")
+(def default-config
+  (or (first (filter fs/exists? ["/etc/unlock/services.json" "/etc/unlock/services.edn"]))
+      "/etc/unlock/services.edn"))
 (def default-op-bin "/usr/local/bin/op")
 (def state-dir (fs/path (fs/home) ".local" "state" "unlock"))
 
@@ -100,9 +102,9 @@
 (defn- path-glob->regex
   "\"/api/**\" -> ** matches anything, * matches within one segment."
   [glob]
-  (re-pattern (-> (java.util.regex.Pattern/quote glob)
-                  (str/replace "**" "\\E.*\\Q")
-                  (str/replace "*" "\\E[^/]*\\Q"))))
+  (re-pattern (apply str (map (fn [token]
+                                ({"**" ".*" "*" "[^/]*"} token (java.util.regex.Pattern/quote token)))
+                              (re-seq #"\*\*|\*|[^*]+" glob)))))
 
 (defn- suspicious-path?
   "Paths whose meaning could differ between our glob match and the upstream's
@@ -334,6 +336,26 @@
      :stop #(server/server-stop! srv)}))
 
 ;; ---------------------------------------------------------------------------
+;; Config
+
+(defn normalise-config
+  "JSON configs (as nix writes them) arrive with strings where EDN has
+  keywords: auth types and allow-rule methods."
+  [config]
+  (update config :services update-vals
+          (fn [svc]
+            (cond-> svc
+              (:auth svc)  (update-in [:auth :type] keyword)
+              (:allow svc) (update :allow (partial mapv (fn [[m glob]]
+                                                          [(keyword (str/lower-case (name m))) glob])))))))
+
+(defn read-config [path]
+  (normalise-config
+   (if (str/ends-with? (str path) ".json")
+     (json/parse-string (slurp path) true)
+     (edn/read-string (slurp path)))))
+
+;; ---------------------------------------------------------------------------
 ;; Install integrity
 
 (defn- writable-by-others?
@@ -346,16 +368,22 @@
         (contains? perms PosixFilePermission/GROUP_WRITE)
         (contains? perms PosixFilePermission/OTHERS_WRITE))))
 
+(defn- in-store? [p] (str/starts-with? (str p) "/nix/store/"))
+
 (defn integrity-problems
   "Anything an agent running as you could rewrite to steal the credential:
-  this script, its config, the op binary, and the directories holding them."
+  this script, its config, the op binary, and the directories holding them.
+  Checks both the path as given and where its symlinks lead. A nix store path
+  is immutable, so its parent (the group-writable store itself) is not checked."
   [paths]
-  (for [path paths
-        p [path (fs/parent path)]
-        :when (and p (or (not (fs/exists? p)) (writable-by-others? p)))]
-    (if (fs/exists? p)
-      (str (fs/canonicalize p) " is not root-owned and write-protected")
-      (str p " does not exist"))))
+  (distinct
+   (for [path paths
+         p (if (fs/exists? path) (distinct [(fs/path path) (fs/canonicalize path)]) [path])
+         q [p (when-not (in-store? p) (fs/parent p))]
+         :when (and q (or (not (fs/exists? q)) (writable-by-others? q)))]
+     (if (fs/exists? q)
+       (str (fs/canonicalize q) " is not root-owned and write-protected")
+       (str q " does not exist")))))
 
 ;; ---------------------------------------------------------------------------
 ;; CLI
@@ -398,7 +426,7 @@
 
 (defn -main [& args]
   (let [{:keys [args opts]} (cli/parse-args args {:spec cli-spec})
-        config (when (fs/exists? (:config opts)) (edn/read-string (slurp (:config opts))))
+        config (when (fs/exists? (:config opts)) (read-config (:config opts)))
         services (:services config)
         [service-name host] args
         service (get services (keyword service-name))]

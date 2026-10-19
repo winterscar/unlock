@@ -139,7 +139,12 @@
     (is (not (u/allowed? svc :get "/api/patients/123/notes")))
     (is (not (u/allowed? svc :get "/api/patients/../admin")))
     (is (not (u/allowed? svc :get "/api/patients/%2e%2e")))
-    (is (u/allowed? {} :delete "/anything")))
+    (is (u/allowed? {} :delete "/anything"))
+    (let [deep {:allow [[:get "/api/**"] [:get "/a/*/c/**.json"]]}]
+      (is (u/allowed? deep :get "/api/x/y/z"))
+      (is (u/allowed? deep :get "/a/b/c/d/e.json"))
+      (is (not (u/allowed? deep :get "/a/b/x/c/e.json")))
+      (is (not (u/allowed? deep :get "/apix")))))
   (with-session [s (service bearer :allow [[:get "/ok"]])]
     (is (= 403 (:status (call s "/nope"))))
     (is (= 200 (:status (call s "/ok"))))
@@ -172,3 +177,25 @@
   (is (= 7200 (u/parse-duration "2h")))
   (is (= 300 (u/parse-duration "5")))
   (is (thrown? Exception (u/parse-duration "soon"))))
+
+(deftest json-config
+  (let [f (java.io.File/createTempFile "unlock" ".json")]
+    (spit f (json/generate-string
+             {:op-bin "/usr/local/bin/op"
+              :services {:opentele {:allow-hosts ["*.oth.io"]
+                                    :auth {:type "oth-client" :client-key "op://a" :client-secret "op://b"}
+                                    :allow [["GET" "/api/**"] ["any" "/health"]]}}}))
+    (let [svc (get-in (u/read-config (str f)) [:services :opentele])]
+      (is (= :oth-client (get-in svc [:auth :type])))
+      (is (= [[:get "/api/**"] [:any "/health"]] (:allow svc)))
+      (is (u/allowed? svc :get "/api/x"))
+      (is (not (u/allowed? svc :post "/api/x"))))
+    (.delete f)))
+
+(deftest integrity
+  (testing "user-writable files are flagged"
+    (is (seq (u/integrity-problems ["unlock.clj"]))))
+  (testing "missing files are flagged"
+    (is (some #(str/includes? % "does not exist") (u/integrity-problems ["/nonexistent/op"]))))
+  (testing "root-owned system files pass"
+    (is (empty? (u/integrity-problems ["/bin/sh"])))))

@@ -1,5 +1,5 @@
-;; unlock services. Installed root-owned at /usr/local/etc/unlock/services.edn
-;; by install.sh; unlock refuses to run while this file is user-writable.
+;; unlock services, EDN form. The nix module writes the same shape as JSON to
+;; /etc/unlock/services.json; this file is for --dry-run and development.
 ;;
 ;; Per service:
 ;;   :allow-hosts   host globs the service may be unlocked against; * is one DNS label

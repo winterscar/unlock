@@ -42,11 +42,11 @@ The design assumes the agent has a shell running as you.
 
 - **No control surface.** There is no admin API, nothing to approve requests
   through, and no policy that reloads. Settings are fixed when you start it.
-- **Root-owned install.** `install.sh` installs the script and its config owned
-  by root, and pins the interpreter to an absolute path (a nix store path).
-  `unlock` refuses to start if the script, config or `op` binary, or the
-  directories holding them, can be written by you. Otherwise an agent could
-  edit them to capture the secret the next time you unlock.
+- **Root-owned install.** The nix module puts the script and its config in the
+  nix store, which nothing can edit, and the script's interpreter is a store
+  path too. `unlock` refuses to start if the script, config or `op` binary,
+  or the directories holding them, can be written by you. Otherwise an agent
+  could edit them to capture the secret the next time you unlock.
 - **One host.** Requests only go to the host you unlocked. Redirects are not
   followed. `:deny-hosts` is checked before anything is read from 1Password.
 - **Agent headers are not trusted.** It drops any `Authorization`, `Cookie` or
@@ -64,32 +64,59 @@ What is still exposed:
   did not expect, so only approve prompts straight after you typed `unlock`.
 - **Response data reaches the agent.** Nothing inspects what the upstream sends
   back. Use `:allow` rules to keep the agent on the paths you mean.
-- **Your shell setup is yours to protect.** An agent could add an alias or
-  function called `unlock` to your shell rc files. Run `/usr/local/bin/unlock`
-  by full path if that worries you.
+- **Your shell setup is yours to protect.** The module defines `unlock` as an
+  alias in `/etc/zshrc` (root-owned), so a fake `unlock` earlier on `PATH`
+  doesn't win. An agent could still override it from your own rc files, or
+  replace the `~/.zshrc` symlink.
 - **It is not a sandbox.** It stops credentials leaking by accident or through
   casual prompt injection, not a determined attacker already running as you.
 
-## Install
+## Install (nix-darwin)
 
-Requirements:
+The flake exports `darwinModules.default`:
 
-- [babashka](https://babashka.org)
-- The 1Password CLI, installed with the official package so `/usr/local/bin/op`
-  is root-owned. The Homebrew cask's symlink will be rejected.
-- "Integrate with 1Password CLI" turned on in the 1Password app, so `op read`
-  asks for Touch ID.
+```nix
+# flake.nix inputs
+unlock = { url = "git+file:///Users/mat/src/unlock"; inputs.nixpkgs.follows = "nixpkgs"; };
 
+# a darwin module
+{ unlock, ... }: {
+  imports = [ unlock.darwinModules.default ];
+  programs.unlock = {
+    enable = true;
+    services.opentele = {
+      allow-hosts = [ "*.oth.io" ];
+      deny-hosts = [ "doccla-prod.oth.io" ];
+      default-host = "doccla-dev.oth.io";
+      auth = {
+        type = "oth-client";
+        client-key = "op://Vault/OTH client {host}/username";
+        client-secret = "op://Vault/OTH client {host}/credential";
+      };
+    };
+  };
+}
 ```
-./install.sh                                  # needs sudo
-sudo -e /usr/local/etc/unlock/services.edn    # point the op:// references at real items
-```
 
-Re-run `install.sh` after changing `unlock.clj` or upgrading babashka.
+Enabling it:
+
+- Turns on nix-darwin's `programs._1password`, which installs the 1Password
+  CLI root-owned at `/usr/local/bin/op`, where the 1Password app's CLI
+  integration needs it.
+- Writes the services to `/etc/unlock/services.json`.
+- Adds `unlock` to the system packages.
+
+The 1Password app itself isn't managed by the module. In its settings, turn on
+Developer > "Integrate with 1Password CLI" so `op read` asks for Touch ID.
+
+After changing `unlock.clj`, commit and run `nix flake update unlock` in the
+system flake.
 
 ## Configuration
 
-See [`services.example.edn`](services.example.edn). `:auth` types:
+See [`services.example.edn`](services.example.edn). In nix, keywords become
+strings: `type = "oth-client"`, `allow = [ [ "get" "/api/**" ] ]`. `:auth`
+types:
 
 - `:bearer`, `:basic` and `:header` inject the secret directly.
 - `:oth-client` exchanges an OpenTele system client's key and secret for a
@@ -102,7 +129,7 @@ environment can have its own 1Password item.
 ## Development
 
 ```
-bb test
+bb test                 # or: nix flake check
 ./unlock.clj opentele --config services.example.edn --dry-run --for 1m
 ```
 
