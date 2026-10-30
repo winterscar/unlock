@@ -15,6 +15,11 @@
 ;;                   :login-method :get         ; default :get
 ;;                   :token-field "token"       ; ...Bearer token read from here (dotted path)
 ;;                   :exp-field "exp"}          ; optional unix-seconds expiry
+;;                  {:type :client-credentials       ; OAuth2 client credentials grant
+;;                   :client-id "op://..." :client-secret "op://..."
+;;                   :token-path "/oauth/tokens"
+;;                   :scope "read"                   ; optional
+;;                   :expires-in 1800}               ; optional, seconds
 ;;   :allow         optional [method path-glob] rules, e.g. [[:get "/api/**"]];
 ;;                  omit to allow every method and path.
 

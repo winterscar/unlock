@@ -126,6 +126,11 @@ types:
   `:exp-field` (default `exp`, unix seconds) is close, and once if a request
   gets a 401. A failed login is not retried until you restart `unlock`,
   because many services lock an account after repeated bad logins.
+- `:client-credentials` does an OAuth2 client credentials grant: it POSTs
+  `client_id` and `client_secret` (plus `:scope` and `:expires-in`, if set)
+  form-encoded to `:token-path` and sends the returned `access_token` as a
+  Bearer token. It fetches a new one when `expires_in` is nearly up, and once
+  if a request gets a 401. As with `:login`, a failed request is not retried.
 
 `{host}` in an `op://` reference is replaced with the unlocked host, so each
 environment can have its own 1Password item.

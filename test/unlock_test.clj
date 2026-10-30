@@ -12,23 +12,38 @@
 
 (def seen (atom []))
 
-(defn- upstream-handler [{:keys [uri headers] :as req}]
-  (swap! seen conj (select-keys req [:request-method :uri :query-string :headers]))
-  (case uri
-    "/auth/login"
-    (if (= (get headers "authorization") (str "Basic " (u/base64 "agent-user:pw-123456")))
-      {:status 200 :body (json/generate-string {:token (str "bearer-" (count @seen)) :exp 9999999999})}
-      {:status 401 :body "{\"message\": \"Invalid credentials\"}"})
-    "/auth/nested"
-    {:status 200 :body (json/generate-string {:data {:access (str "bearer-" (count @seen))}})}
-    "/echo-secret" {:status 200
-                   :headers {"x-echo" (str (get headers "authorization"))}
-                   :body (str "your key is s3cret-value-123, you sent " (get headers "authorization"))}
-    "/redirect"    {:status 302 :headers {"location" "https://elsewhere.example/"}}
-    "/expire"      (if (= "Bearer bearer-1" (get headers "authorization"))
-                     {:status 401}
-                     {:status 200 :body "refreshed"})
-    {:status 200 :body "ok"}))
+(defn- form-params [body]
+  (into {} (for [pair (str/split (slurp body) #"&")
+                 :let [[k v] (str/split pair #"=" 2)]]
+             [(java.net.URLDecoder/decode k "UTF-8") (java.net.URLDecoder/decode v "UTF-8")])))
+
+(defn- upstream-handler [{:keys [uri headers body] :as req}]
+  (let [form (when (= "/oauth/tokens" uri) (form-params body))]
+    (swap! seen conj (cond-> (select-keys req [:request-method :uri :query-string :headers])
+                       form (assoc :form form)))
+    (case uri
+      "/auth/login"
+      (if (= (get headers "authorization") (str "Basic " (u/base64 "agent-user:pw-123456")))
+        {:status 200 :body (json/generate-string {:token (str "bearer-" (count @seen)) :exp 9999999999})}
+        {:status 401 :body "{\"message\": \"Invalid credentials\"}"})
+      "/oauth/tokens"
+      (if (and (= "client_credentials" (form "grant_type"))
+               (= "client-abc" (form "client_id"))
+               (= "csecret-123456" (form "client_secret")))
+        {:status 200 :body (json/generate-string {:access_token (str "bearer-" (count @seen))
+                                                  :token_type "bearer"
+                                                  :expires_in (parse-long (form "expires_in" "1800"))})}
+        {:status 401 :body "{\"error\": \"invalid_client\"}"})
+      "/auth/nested"
+      {:status 200 :body (json/generate-string {:data {:access (str "bearer-" (count @seen))}})}
+      "/echo-secret" {:status 200
+                     :headers {"x-echo" (str (get headers "authorization"))}
+                     :body (str "your key is s3cret-value-123, you sent " (get headers "authorization"))}
+      "/redirect"    {:status 302 :headers {"location" "https://elsewhere.example/"}}
+      "/expire"      (if (= "Bearer bearer-1" (get headers "authorization"))
+                       {:status 401}
+                       {:status 200 :body "refreshed"})
+      {:status 200 :body "ok"})))
 
 (def upstream (atom nil))
 
@@ -48,7 +63,9 @@
   {"op://V/bearer/credential" "s3cret-value-123"
    "op://V/login 127.0.0.1/username" "agent-user"
    "op://V/login 127.0.0.1/password" "pw-123456"
-   "op://V/login/wrong-password" "not-the-password"})
+   "op://V/login/wrong-password" "not-the-password"
+   "op://V/oauth/client-id" "client-abc"
+   "op://V/oauth/client-secret" "csecret-123456"})
 
 (defn- deps []
   {:read-secret #(or (secrets (str/replace % #":\d+" "")) (throw (ex-info (str "no secret " %) {})))
@@ -63,6 +80,11 @@
             :login-path "/auth/login"
             :username "op://V/login {host}/username"
             :password "op://V/login {host}/password"})
+
+(def client-credentials {:type :client-credentials
+                         :token-path "/oauth/tokens"
+                         :client-id "op://V/oauth/client-id"
+                         :client-secret "op://V/oauth/client-secret"})
 
 (defmacro with-session [[sym svc] & body]
   `(let [~sym (u/start! {:service-name :test :service ~svc :host (upstream-host)} (deps))]
@@ -191,6 +213,44 @@
       (is (str/includes? (:body r1) "not retrying"))
       (is (= 502 (:status r2)))
       (is (= ["/auth/login"] (map :uri @seen)) "one login attempt, and no upstream calls"))))
+
+(deftest client-credentials-exchange
+  (with-session [s (service (assoc client-credentials :scope "read"))]
+    (is (= 200 (:status (call s "/a"))))
+    (is (= 200 (:status (call s "/b"))))
+    (testing "fetches a token once with a form-encoded grant, then reuses it"
+      (is (= ["/oauth/tokens" "/a" "/b"] (map :uri @seen)))
+      (is (= :post (:request-method (first @seen))))
+      (is (= {"grant_type" "client_credentials" "client_id" "client-abc"
+              "client_secret" "csecret-123456" "scope" "read"}
+             (:form (first @seen))))
+      (is (= "Bearer bearer-1" (get-in (nth @seen 1) [:headers "authorization"]))))
+    (testing "the token and client secret are scrubbed from what the agent sees"
+      (let [r (call s "/echo-secret")]
+        (is (not (str/includes? (get-in r [:headers "x-echo"]) "bearer-")))
+        (is (not (str/includes? (:body r) "bearer-"))))))
+  (reset! seen [])
+  (with-session [s (service client-credentials)]
+    (testing "a 401 forces one fresh token and retry"
+      (is (= 200 (:status (call s "/expire"))))
+      (is (= ["/oauth/tokens" "/expire" "/oauth/tokens" "/expire"] (map :uri @seen))))))
+
+(deftest client-credentials-expiry
+  ;; expires_in is relative; a token within a minute of expiring is replaced.
+  (with-session [s (service (assoc client-credentials :expires-in 30))]
+    (call s "/a")
+    (call s "/b")
+    (is (= ["/oauth/tokens" "/a" "/oauth/tokens" "/b"] (map :uri @seen)))
+    (is (= "30" (get-in (first @seen) [:form "expires_in"])))))
+
+(deftest failed-client-credentials-is-not-retried
+  (with-session [s (service (assoc client-credentials :client-secret "op://V/login/wrong-password"))]
+    (let [r1 (call s "/a")
+          r2 (call s "/b")]
+      (is (= 502 (:status r1)))
+      (is (str/includes? (:body r1) "token request at /oauth/tokens failed (HTTP 401)"))
+      (is (= 502 (:status r2)))
+      (is (= ["/oauth/tokens"] (map :uri @seen))))))
 
 (deftest durations
   (is (= 1800 (u/parse-duration "30m")))

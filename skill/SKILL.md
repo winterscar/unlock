@@ -34,7 +34,7 @@ The proxy's own errors are plain text starting `unlock:`. Anything else came fro
 | 401 "missing or wrong X-Unlock-Token" | Stale token; each unlock issues a new one | Re-read the state file |
 | Connection refused | The session expired or was locked | Ask the user to unlock again |
 | 403 "… is not allowed for this service" | A path rule blocks it | Tell the user; don't look for another route |
-| 502 "login … failed; not retrying" | The 1Password item's credentials were rejected | Stop. Ask the user to fix the item, then Ctrl-C and rerun `unlock`. Retrying elsewhere risks locking the account |
+| 502 "login … failed" or "token request … failed; not retrying" | The 1Password item's credentials were rejected | Stop. Ask the user to fix the item, then Ctrl-C and rerun `unlock`. Retrying elsewhere risks locking the account |
 
 ## Blocked hosts are deliberate
 

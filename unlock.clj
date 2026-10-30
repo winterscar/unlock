@@ -147,7 +147,12 @@
   {:bearer     [:token]
    :basic      [:username :password]
    :header     [:value]
-   :login      [:username :password]})
+   :login      [:username :password]
+   :client-credentials [:client-id :client-secret]})
+
+(def ^:private token-types
+  "Auth types that swap their credentials for a short-lived Bearer token."
+  #{:login :client-credentials})
 
 (defn resolve-secrets
   "Reads every secret the service's :auth needs. Returns the auth map with the
@@ -181,44 +186,74 @@
   [m dotted]
   (get-in m (map keyword (str/split dotted #"\."))))
 
-(defn- login!
-  "Swaps Basic credentials for a Bearer token at the service's :login-path.
-  Many services count failed logins towards locking the account, so a failure
-  is remembered in `token-cache` and no further login is attempted until
-  unlock is restarted."
-  [send base-url {:keys [login-path login-method token-field exp-field username password]} token-cache]
-  (let [resp (send {:method (or login-method :get)
-                    :uri (str base-url login-path)
-                    :headers {"authorization" (str "Basic " (base64 (str username ":" password)))
-                              "accept" "application/json"}})
+(defn- form-encode [m]
+  (str/join "&" (for [[k v] m]
+                  (str (java.net.URLEncoder/encode (str k) "UTF-8") "="
+                       (java.net.URLEncoder/encode (str v) "UTF-8")))))
+
+(defn- token-request
+  "The request that swaps the service's credentials for a Bearer token.
+  :login sends Basic credentials to :login-path; :client-credentials does an
+  OAuth2 client credentials grant at :token-path."
+  [base-url {:keys [type username password client-id client-secret scope expires-in] :as auth}]
+  (case type
+    :login
+    {:method (or (:login-method auth) :get)
+     :uri (str base-url (:login-path auth))
+     :headers {"authorization" (str "Basic " (base64 (str username ":" password)))
+               "accept" "application/json"}}
+    :client-credentials
+    {:method :post
+     :uri (str base-url (:token-path auth))
+     :headers {"content-type" "application/x-www-form-urlencoded"
+               "accept" "application/json"}
+     :body (form-encode (cond-> [["grant_type" "client_credentials"]
+                                 ["client_id" client-id]
+                                 ["client_secret" client-secret]]
+                          scope      (conj ["scope" scope])
+                          expires-in (conj ["expires_in" expires-in])))}))
+
+(defn- fetch-token!
+  "Swaps the service's credentials for a Bearer token. Many services count
+  failed logins towards locking the account, so a failure is remembered in
+  `token-cache` and no further attempt is made until unlock is restarted."
+  [send base-url {:keys [type token-field exp-field] :as auth} token-cache]
+  (let [req (token-request base-url auth)
+        resp (send req)
         body (when (= 200 (:status resp))
                (json/parse-string (String. ^bytes (:body resp) StandardCharsets/UTF_8) true))
-        token (some-> body (json-field (or token-field "token")))]
+        login? (= :login type)
+        token (some-> body (json-field (or token-field (if login? "token" "access_token"))))]
     (when-not token
-      (let [msg (str "login at " login-path " failed (HTTP " (:status resp)
+      (let [msg (str (if login? "login" "token request") " at "
+                     (subs (:uri req) (count base-url)) " failed (HTTP " (:status resp)
                      (when (= 200 (:status resp)) ", no token in response")
                      "); not retrying until unlock is restarted")]
         (swap! token-cache assoc :failed msg)
         (throw (ex-info msg {}))))
     ;; With no expiry to go on, the token is reused until the upstream 401s.
     {:token token
-     :exp (or (some-> body (json-field (or exp-field "exp"))) Long/MAX_VALUE)}))
+     :exp (or (if login?
+                (some-> body (json-field (or exp-field "exp")))
+                (some->> (:expires_in body) (+ (now-s))))
+              Long/MAX_VALUE)}))
 
 (defn- auth-header
-  "[header-name value] to inject, logging in again when a :login token is close
-  to expiry or when `force?` says the upstream just rejected it."
+  "[header-name value] to inject, fetching a new token when a :login or
+  :client-credentials token is close to expiry or when `force?` says the
+  upstream just rejected it."
   [{:keys [auth base-url send token-cache]} force?]
   (case (:type auth)
     :bearer ["authorization" (str "Bearer " (:token auth))]
     :basic  ["authorization" (str "Basic " (base64 (str (:username auth) ":" (:password auth))))]
     :header [(str/lower-case (:name auth)) (str/replace (or (:format auth) "{}") "{}" (:value auth))]
-    :login
+    (:login :client-credentials)
     (let [{:keys [token exp failed]} @token-cache]
       (cond
         failed (throw (ex-info failed {}))
         (and token (not force?) (> exp (+ (now-s) 60))) ["authorization" (str "Bearer " token)]
         :else
-        (let [fresh (login! send base-url auth token-cache)]
+        (let [fresh (fetch-token! send base-url auth token-cache)]
           (reset! token-cache fresh)
           ["authorization" (str "Bearer " (:token fresh))])))))
 
@@ -313,7 +348,7 @@
                                        :body body})))
                     resp (try
                            (let [r (attempt false)]
-                             (if (and (= 401 (:status r)) (= :login (get-in service [:auth :type])))
+                             (if (and (= 401 (:status r)) (token-types (get-in service [:auth :type])))
                                (attempt true)
                                r))
                            (catch clojure.lang.ExceptionInfo e
@@ -428,16 +463,24 @@
 (defn- dry-run-deps [service]
   {:read-secret (fn [ref] (str "dry-run-secret-for:" ref))
    :send (fn [{:keys [method uri headers]}]
-           (if (and (= :login (get-in service [:auth :type]))
-                    (str/ends-with? (first (str/split uri #"\?")) (get-in service [:auth :login-path])))
-             {:status 200 :headers {"content-type" "application/json"}
-              :body (.getBytes (json/generate-string {:token "dry-run-bearer" :exp (+ (now-s) 1800)}))}
-             {:status 200
-              :headers {"content-type" "application/json"}
-              :body (.getBytes (json/generate-string
-                                {:dry-run true
-                                 :would-send {:method method :uri uri
-                                              :headers (sort (keys headers))}}))}))})
+           (let [{:keys [type login-path token-path]} (:auth service)
+                 path (first (str/split uri #"\?"))]
+             (cond
+               (and (= :login type) (str/ends-with? path login-path))
+               {:status 200 :headers {"content-type" "application/json"}
+                :body (.getBytes (json/generate-string {:token "dry-run-bearer" :exp (+ (now-s) 1800)}))}
+
+               (and (= :client-credentials type) (str/ends-with? path token-path))
+               {:status 200 :headers {"content-type" "application/json"}
+                :body (.getBytes (json/generate-string {:access_token "dry-run-bearer" :expires_in 1800}))}
+
+               :else
+               {:status 200
+                :headers {"content-type" "application/json"}
+                :body (.getBytes (json/generate-string
+                                  {:dry-run true
+                                   :would-send {:method method :uri uri
+                                                :headers (sort (keys headers))}}))})))})
 
 (defn- write-state! [session expires-at]
   (fs/create-dirs state-dir)
